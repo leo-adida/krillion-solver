@@ -6,12 +6,18 @@ A small Windows desktop helper for looking up and recording answers for Krillion
 
 - Search previously reported answers for a game mode and prompt.
 - Show reported level and whether an answer was accepted, rejected, or is unverified.
-- Suggest country names and a small set of common topic examples.
+- Copy a selected answer or record it as accepted/rejected directly from the result list.
+- Suggest country names and common aliases for country prompts, including letter-constrained prompts.
+- Regenerate AI candidates without reusing the current suggestions or cached response.
+- Switch to a compact window after prompt detection, or return to full view; clear the current results when needed.
+- Suggest a seeded list of real coastal cities for city prompts.
 - Optionally ask a local Ollama model for 5–10 more candidates when the stored list is short.
+- Show complete AI answer lines as they arrive and ignore results from prompts you have since changed.
+- Check explicit starts-with, ends-with, and contains-letter rules against local and AI suggestions.
 - Record your own result so the answer database improves over time.
 - Run with SQLite out of the box, or PostgreSQL when `DATABASE_URL` is configured.
 
-This is a companion, not an automatic game client. Enter the category/prompt manually. A model suggestion is not proof that Krillion accepts an answer. The app labels stored accepted reports separately from generated/unverified suggestions.
+This is a companion, not an automatic game client. It can detect visible prompts in its separate browser window or accept manual prompt entry. A model suggestion is not proof that Krillion accepts an answer. The app labels stored accepted reports separately from generated/unverified suggestions.
 
 ## Windows quick start (no PostgreSQL or AI required)
 
@@ -23,12 +29,19 @@ This is a companion, not an automatic game client. Enter the category/prompt man
    py -m venv .venv
    .\.venv\Scripts\Activate.ps1
    pip install -r requirements.txt
+   py -m playwright install chromium
    py app.py
    ```
 
    If PowerShell blocks activation, use `\.venv\Scripts\python.exe app.py` instead.
 
 The default SQLite database is created at `data/krillion.db`.
+
+## Detect the current game prompt
+
+Choose **Krillion** or **Puffer Party**, then click **Detect prompt**. The app opens a separate Chromium window, navigates to that game, watches visible page text, and searches automatically when a question/category prompt appears. The Chromium profile is stored under `data/browser-profile` and persists between launches. Click **Stop detection** to close the monitoring browser.
+
+This browser window is separate from Chrome and has its own sign-in/profile. If Chromium is missing, install it with `py -m playwright install chromium`. Detection works from visible text; prompts rendered only as images or canvas text may not be recognized. Use **Stop detection** to close the monitoring browser.
 
 ## PostgreSQL setup (optional)
 
@@ -59,7 +72,9 @@ Do not use the example password for a server exposed to the internet. Keep crede
 3. Keep Ollama running (normally it runs as a background service). The app calls `http://localhost:11434/api/generate` and uses `qwen2.5:3b` by default.
 4. In the app, select **Ollama AI suggestions**. To change the model or endpoint, set `OLLAMA_MODEL` or `OLLAMA_URL` in `.env` and restart.
 
-The request asks Ollama to keep the model loaded for 10 minutes and caps generation at 120 tokens (`OLLAMA_KEEP_ALIVE`, `OLLAMA_NUM_PREDICT`). AI is skipped when lookup already finds at least five distinct accepted or lexicon answers. Otherwise it requests only enough candidates to approach eight total. Generated lists are cached in memory for 12 hours per model, mode, prompt, and known-answer set; restarting the app clears this cache.
+The request asks Ollama to keep the model loaded for 10 minutes and caps generation at 64 tokens (`OLLAMA_KEEP_ALIVE`, `OLLAMA_NUM_PREDICT`). AI is skipped when lookup already finds at least five distinct accepted or lexicon answers. Otherwise it requests only enough candidates to approach five total. Ollama is asked for schema-constrained JSON containing answer strings, and the app drops entries that look like explanations instead of concise answers. Answer strings appear as they arrive. Generated lists are cached in memory for 12 hours per model, mode, prompt, and known-answer set; restarting the app clears this cache.
+
+Select an answer row to copy it, or use **Accepted** / **Rejected** to save feedback directly. Expand **Add player report** to enter a report manually, including its level, reporter, and note. **Regenerate** requests a fresh set and excludes the currently displayed answers. **Clear** empties the results and cancels pending display updates. Results from an earlier search are ignored after you start a new one. The first AI result is labeled as a model fallback, but remains unverified; only a recorded accepted answer is confirmed by prior play. The AI prompt prioritizes factual, independently existing entities, tells the model not to invent names or use game-related terms, and allows it to abstain. A local coastal-city list and country-name aliases provide fallback suggestions. Clear letter rules in the prompt are also checked locally before suggestions are shown. Prompt detection switches the app to compact view; **Full view** restores the mode controls and player-report section.
 
 No model is bundled or trained in this early version. The model generates candidate answers only; it cannot guarantee acceptance or rarity. Reports you record are the evidence the solver can use to identify known accepted answers.
 

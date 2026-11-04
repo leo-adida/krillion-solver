@@ -34,18 +34,91 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.casefold(), flags=re.UNICODE)).strip()
 
 
+def candidate_matches_prompt(answer: str, prompt: str) -> bool:
+    """Enforce clear letter constraints; leave less explicit rules to the model/player."""
+    text = prompt.casefold()
+    candidate = answer.strip().casefold()
+    first_letter = re.search(r"\b(?:start(?:s|ing)?|begin(?:s|ning)?)\s+with\s+(?:the\s+)?(?:letter\s+)?['\"]?([a-z])\b", text)
+    last_letter = re.search(r"\bend(?:s|ing)?\s+with\s+(?:the\s+)?(?:letter\s+)?['\"]?([a-z])\b", text)
+    contains_letter = re.search(r"\bcontains?\s+(?:the\s+)?letter\s+['\"]?([a-z])\b", text)
+    if first_letter and not candidate.startswith(first_letter.group(1)):
+        return False
+    if last_letter and not candidate.endswith(last_letter.group(1)):
+        return False
+    if contains_letter and contains_letter.group(1) not in candidate:
+        return False
+    return True
+
+
+def detect_question(page_text: str) -> str | None:
+    """Find a likely standalone game prompt in visible browser text."""
+    direct = re.compile(r"^(?:name|list|give|think of|come up with|say|tell me|identify|which|what|who|where|when|how)\b", re.I)
+    candidates: list[tuple[int, str]] = []
+    for raw_line in page_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" \t•*-–—")
+        line = re.sub(r"^(?:question|prompt|category)(?:\s*\d+)?\s*[:：-]\s*", "", line, flags=re.I)
+        line = re.sub(r"^\d+[.)]\s*", "", line)
+        if not 8 <= len(line) <= 180:
+            continue
+        if not direct.match(line):
+            continue
+        # Ignore instructions/help text; these tend to be full explanatory sentences.
+        if re.search(r"\b(?:press|click|type|enter|submit|timer|round starts|take turns)\b", line, re.I):
+            continue
+        score = 2 if re.match(r"^(?:name|list|give|think of|come up with)\b", line, re.I) else 1
+        if line.endswith("?"):
+            score += 1
+        candidates.append((score, line.rstrip(".!? ")))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
 COUNTRIES = [
     "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria", "Azerbaijan",
     "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burkina Faso", "Burundi",
-    "Cabo Verde", "Cambodia", "Cameroon", "Canada", "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Costa Rica", "Croatia", "Cuba", "Cyprus", "Czechia",
+    "Cabo Verde", "Cambodia", "Cameroon", "Canada", "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Costa Rica", "Côte d'Ivoire", "Croatia", "Cuba", "Cyprus", "Czechia",
     "Democratic Republic of the Congo", "Denmark", "Djibouti", "Dominica", "Dominican Republic", "Ecuador", "Egypt", "El Salvador", "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini", "Ethiopia",
     "Fiji", "Finland", "France", "Gabon", "Gambia", "Georgia", "Germany", "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Israel", "Italy", "Jamaica", "Japan", "Jordan",
     "Kazakhstan", "Kenya", "Kiribati", "Kosovo", "Kuwait", "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Madagascar", "Malawi", "Malaysia", "Maldives", "Mali", "Malta", "Marshall Islands", "Mauritania", "Mauritius", "Mexico", "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco", "Mozambique", "Myanmar",
     "Namibia", "Nauru", "Nepal", "Netherlands", "New Zealand", "Nicaragua", "Niger", "Nigeria", "North Korea", "North Macedonia", "Norway", "Oman", "Pakistan", "Palau", "Palestine", "Panama", "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland", "Portugal", "Qatar", "Republic of the Congo", "Romania", "Russia", "Rwanda", "Saint Kitts and Nevis", "Saint Lucia", "Saint Vincent and the Grenadines", "Samoa", "San Marino", "Sao Tome and Principe", "Saudi Arabia", "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Slovakia", "Slovenia", "Solomon Islands", "Somalia", "South Africa", "South Korea", "South Sudan", "Spain", "Sri Lanka", "Sudan", "Suriname", "Sweden", "Switzerland", "Syria", "Taiwan", "Tajikistan", "Tanzania", "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad and Tobago", "Tunisia", "Turkey", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Uruguay", "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam", "Yemen", "Zambia", "Zimbabwe"
 ]
 
+COUNTRY_ALIASES = {
+    "Bahamas": ["The Bahamas"],
+    "Cabo Verde": ["Cape Verde"],
+    "Côte d'Ivoire": ["Ivory Coast"],
+    "Czechia": ["Czech Republic"],
+    "Democratic Republic of the Congo": ["DR Congo", "Congo-Kinshasa"],
+    "Eswatini": ["Swaziland"],
+    "Gambia": ["The Gambia"],
+    "Laos": ["Lao People's Democratic Republic"],
+    "Micronesia": ["Federated States of Micronesia"],
+    "Moldova": ["Republic of Moldova"],
+    "Myanmar": ["Burma"],
+    "Netherlands": ["Holland"],
+    "North Macedonia": ["Macedonia"],
+    "Palestine": ["State of Palestine"],
+    "Republic of the Congo": ["Congo-Brazzaville"],
+    "Russia": ["Russian Federation"],
+    "South Korea": ["Republic of Korea", "Korea, South"],
+    "Syria": ["Syrian Arab Republic"],
+    "Taiwan": ["Republic of China"],
+    "Tanzania": ["United Republic of Tanzania"],
+    "Timor-Leste": ["East Timor"],
+    "Turkey": ["Türkiye", "Republic of Türkiye"],
+    "United Kingdom": ["UK", "U.K.", "Great Britain", "Britain"],
+    "United States": ["USA", "U.S.A.", "US", "U.S.", "United States of America", "America"],
+    "Vatican City": ["Holy See"],
+    "Vietnam": ["Viet Nam"],
+}
+
 LEXICON = {
     "countries": COUNTRIES,
+    "coastal cities": [
+        "Alexandria", "Auckland", "Barcelona", "Boston", "Busan", "Cape Town", "Casablanca", "Chennai", "Copenhagen", "Dakar",
+        "Dublin", "Durban", "Helsinki", "Honolulu", "Hong Kong", "Lagos", "Lima", "Lisbon", "Los Angeles", "Manila",
+        "Marseille", "Miami", "Mumbai", "Mombasa", "Naples", "New York City", "Oslo", "Reykjavik", "Rio de Janeiro",
+        "San Francisco", "Seattle", "Shanghai", "Singapore", "Stockholm", "Sydney", "Tokyo", "Valparaiso", "Vancouver", "Venice", "Wellington"
+    ],
     "planets": ["Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"],
     "continents": ["Africa", "Antarctica", "Asia", "Europe", "North America", "Oceania", "South America"],
     "oceans": ["Arctic Ocean", "Atlantic Ocean", "Indian Ocean", "Pacific Ocean", "Southern Ocean"],
@@ -109,7 +182,10 @@ class Store:
     def seed_lexicon(self) -> None:
         for topic, answers in LEXICON.items():
             for answer in answers:
-                self._execute("INSERT INTO lexicon(topic, answer, normalized_answer) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", (topic, answer, normalize(answer)))
+                aliases = "|".join(COUNTRY_ALIASES.get(answer, [])) if topic == "countries" else ""
+                self._execute("""INSERT INTO lexicon(topic, answer, normalized_answer, aliases)
+                    VALUES (?, ?, ?, ?) ON CONFLICT(topic, normalized_answer)
+                    DO UPDATE SET aliases=excluded.aliases""", (topic, answer, normalize(answer), aliases))
         self.conn.commit()
 
     def ensure_prompt(self, mode: str, category: str) -> int:
@@ -130,9 +206,25 @@ class Store:
         cat = normalize(category)
         topic_map = {normalize(topic): topic for topic in LEXICON}
         topic = topic_map.get(cat)
+        if not topic and re.search(r"\b(?:coastal|seaside)\s+cit(?:y|ies)\b", cat):
+            topic = "coastal cities"
+        country_prompt = re.fullmatch(
+            r"(?:(?:name|list|give|think of|identify)\s+)?(?:(?:a|an|any|one|all|some)\s+)?(?:countr(?:y|ies)|nation(?:s)?)"
+            r"(?:\s+(?:that\s+)?(?:whose\s+name\s+)?(?:start(?:s|ing)?|begin(?:s|ning)?|end(?:s|ing)?|contain(?:s|ing)\s+(?:the\s+)?letter)\b.*)?",
+            cat,
+        )
+        if not topic and country_prompt:
+            topic = "countries"
         if topic:
-            rows = self._execute("SELECT answer FROM lexicon WHERE topic=? ORDER BY answer", (topic,)).fetchall()
-            return [r["answer"] if isinstance(r, dict) else r[0] for r in rows]
+            rows = self._execute("SELECT answer, aliases FROM lexicon WHERE topic=? ORDER BY answer", (topic,)).fetchall()
+            answers: list[str] = []
+            for row in rows:
+                answer = row["answer"] if isinstance(row, dict) else row[0]
+                aliases = row["aliases"] if isinstance(row, dict) else row[1]
+                answers.append(answer)
+                if aliases:
+                    answers.extend(alias for alias in aliases.split("|") if alias)
+            return answers
         return []
 
     def save_report(self, mode: str, category: str, answer: str, status: str, level: str, reporter: str, note: str) -> None:
@@ -146,34 +238,117 @@ AI_CACHE: dict[tuple, tuple[float, list[str]]] = {}
 AI_CACHE_TTL = 12 * 60 * 60
 
 
-def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = "Krillion") -> list[str]:
+def clean_ai_answer(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    answer = value.strip().strip("\"'` ")
+    lower = answer.casefold()
+    if not answer or len(answer) > 90 or len(answer.split()) > 6 or "\n" in answer or "\r" in answer:
+        return None
+    if re.match(r"^(?:the answer is|answer\s*:|fallback\s*:|here (?:is|are)|for example|i (?:think|would)|a possible answer|uncertain)\b", lower):
+        return None
+    if re.search(r"\b(?:because|which is|that is|located in|known for|sounds like|would be|is a|is an|are a|are an|i would choose)\b", lower):
+        return None
+    if any(mark in answer for mark in ("\t", ";", ":", "?", "!", "(", ")", "—", "–")) or ", " in answer or " or " in lower:
+        return None
+    if re.search(r"\b(?:is|are|was|were)\s+(?:located|situated|coastal|a|an|the)\b", lower):
+        return None
+    return answer
+
+
+def ollama_suggest(category: str, known: list[str], count: int = 5, mode: str = "Krillion", on_candidate=None, force: bool = False) -> list[str]:
     endpoint = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     cache_key = (model, mode, normalize(category), count, tuple(sorted(normalize(x) for x in known)))
     cached = AI_CACHE.get(cache_key)
-    if cached and time.time() - cached[0] < AI_CACHE_TTL:
+    if not force and cached and time.time() - cached[0] < AI_CACHE_TTL:
+        if on_candidate:
+            for index, answer in enumerate(cached[1]):
+                on_candidate(answer, index == 0)
         return cached[1]
-    prompt = (f"Give {count} distinct plausible answers for the {mode} category: {category!r}. "
-              "Return only one short answer per line; no numbering, explanations, or introductions. "
-              "Prefer valid, recognizable, somewhat uncommon answers and include a familiar fallback. "
-              "Do not repeat these known answers: " + ", ".join(known[:40]))
+    count = max(1, min(count, 5))
+    prompt = (
+        f"For {mode}, answer this category: {category!r}. Return up to {count} answers. "
+        "Use only real, independently existing things that clearly fit. Never invent or embellish names, and do not use Krillion/game terms unless requested. "
+        "For places, name real recognized places; coastal cities must touch a sea, ocean, gulf, or bay. Obey explicit letter rules. "
+        "First answer should be a familiar, low-risk fallback. Omit anything uncertain and do not explain. "
+        "Avoid these known answers: " + ", ".join(known[:20])
+    )
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "answers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": count,
+            }
+        },
+        "required": ["answers"],
+        "additionalProperties": False,
+    }
+    token_budget = min(64, max(1, int(os.getenv("OLLAMA_NUM_PREDICT", "64"))))
     payload = json.dumps({
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "format": output_schema,
+        "stream": True,
         "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "10m"),
-        "options": {"num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "120")), "temperature": 0.35},
+        "options": {"num_predict": token_budget, "temperature": 0.2},
     }).encode("utf-8")
     req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=45) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    lines = result.get("response", "").splitlines()
     answers = []
-    for line in lines:
-        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip().strip("\"'` ")
-        if line and normalize(line) not in {normalize(x) for x in known + answers}:
-            answers.append(line)
-    answers = answers[:10]
+    generated = ""
+    array_cursor: int | None = None
+    decoder = json.JSONDecoder()
+
+    def accept_value(value: object) -> None:
+        answer = clean_ai_answer(value)
+        if answer and candidate_matches_prompt(answer, category) and normalize(answer) not in {normalize(x) for x in known + answers}:
+            answers.append(answer)
+            if on_candidate:
+                on_candidate(answer, len(answers) == 1)
+
+    def consume_complete_values() -> None:
+        nonlocal array_cursor
+        if array_cursor is None:
+            match = re.search(r'"answers"\s*:\s*\[', generated)
+            if not match:
+                return
+            array_cursor = match.end()
+        while array_cursor < len(generated):
+            while array_cursor < len(generated) and (generated[array_cursor].isspace() or generated[array_cursor] == ","):
+                array_cursor += 1
+            if array_cursor >= len(generated) or generated[array_cursor] == "]":
+                return
+            try:
+                value, end = decoder.raw_decode(generated, array_cursor)
+            except json.JSONDecodeError:
+                return
+            array_cursor = end
+            accept_value(value)
+
+    with urllib.request.urlopen(req, timeout=45) as response:
+        for raw_line in response:
+            if not raw_line.strip():
+                continue
+            stream_item = json.loads(raw_line.decode("utf-8"))
+            if stream_item.get("error"):
+                raise RuntimeError(stream_item["error"])
+            generated += stream_item.get("response", "")
+            consume_complete_values()
+            if len(answers) >= min(count, 10):
+                break
+    try:
+        parsed = json.loads(generated)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), list):
+            raise ValueError("Ollama response did not contain an answers list")
+        if not answers:
+            for value in parsed["answers"][:count]:
+                accept_value(value)
+    except json.JSONDecodeError as exc:
+        if not answers:
+            raise RuntimeError("Ollama did not return the required answer-only JSON") from exc
+    answers = answers[:count]
     AI_CACHE[cache_key] = (time.time(), answers)
     return answers
 
@@ -182,41 +357,71 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Krillion Solver — early version")
-        self.geometry("700x520")
-        self.minsize(600, 480)
+        self.geometry("560x460")
+        self.minsize(500, 420)
         try:
             self.store = Store()
         except Exception as exc:
             messagebox.showerror("Database connection", str(exc))
             self.destroy()
             return
+        self.search_generation = 0
+        self.result_answers: dict[int, str] = {}
+        self.browser_thread: threading.Thread | None = None
+        self.browser_stop: threading.Event | None = None
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def _build(self):
         root = ttk.Frame(self, padding=14)
         root.pack(fill="both", expand=True)
-        ttk.Label(root, text="Krillion Solver", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(root, text="Manual lookup for Krillion and Puffer Party. Suggestions are not guaranteed accepted.").pack(anchor="w", pady=(0, 12))
+        header = ttk.Frame(root)
+        header.pack(fill="x", pady=(0, 8))
+        ttk.Label(header, text="Krillion Solver", font=("Segoe UI", 16, "bold")).pack(side="left")
         self.always_on_top = tk.BooleanVar(value=False)
-        ttk.Checkbutton(root, text="Always on top", variable=self.always_on_top, command=self._toggle_topmost).pack(anchor="w", pady=(0, 8))
+        ttk.Checkbutton(header, text="Always on top", variable=self.always_on_top, command=self._toggle_topmost).pack(side="right", padx=(6, 0))
+        self.compact_mode = False
+        self.view_button = ttk.Button(header, text="Compact", command=self.toggle_compact)
+        self.view_button.pack(side="right")
         form = ttk.Frame(root)
         form.pack(fill="x")
-        ttk.Label(form, text="Mode").grid(row=0, column=0, sticky="w")
+        self.form = form
+        self.mode_label = ttk.Label(form, text="Mode")
+        self.mode_label.grid(row=0, column=0, sticky="w")
         self.mode = tk.StringVar(value="Krillion")
-        ttk.Combobox(form, textvariable=self.mode, values=["Krillion", "Puffer Party"], state="readonly", width=18).grid(row=1, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(form, text="Category / prompt").grid(row=0, column=1, sticky="w")
+        self.mode_combo = ttk.Combobox(form, textvariable=self.mode, values=["Krillion", "Puffer Party"], state="readonly", width=18)
+        self.mode_combo.grid(row=1, column=0, sticky="w", padx=(0, 12))
+        self.category_label = ttk.Label(form, text="Category / prompt")
+        self.category_label.grid(row=0, column=1, sticky="w")
         self.category = tk.StringVar()
-        cat = ttk.Entry(form, textvariable=self.category)
-        cat.grid(row=1, column=1, sticky="ew", padx=(0, 12))
-        ttk.Button(form, text="Find answers", command=self.search).grid(row=1, column=2)
+        self.category_entry = ttk.Entry(form, textvariable=self.category)
+        self.category_entry.grid(row=1, column=1, sticky="ew", padx=(0, 12))
+        self.search_button = ttk.Button(form, text="Search", command=self.search)
+        self.search_button.grid(row=1, column=2)
         form.columnconfigure(1, weight=1)
+        browser_controls = ttk.Frame(root)
+        browser_controls.pack(fill="x", pady=(8, 0))
+        self.detect_button = ttk.Button(browser_controls, text="Detect prompt", command=self.toggle_detection)
+        self.detect_button.pack(side="left", padx=(0, 8))
+        self.detection_status = tk.StringVar(value="Browser detection is stopped.")
+        ttk.Label(browser_controls, textvariable=self.detection_status, foreground="#555").pack(side="left", fill="x", expand=True)
         self.use_ai = tk.BooleanVar(value=False)
-        ttk.Checkbutton(root, text="Ollama AI suggestions (optional; unverified)", variable=self.use_ai).pack(anchor="w", pady=(8, 4))
-        self.results = tk.Listbox(root, height=8, font=("Segoe UI", 10))
+        ttk.Checkbutton(root, text="Ollama AI suggestions (optional; unverified)", variable=self.use_ai).pack(anchor="w", pady=(5, 4))
+        self.results = tk.Listbox(root, height=5, font=("Segoe UI", 10))
         self.results.pack(fill="both", expand=True, pady=(4, 10))
-        self.results.insert("end", "Enter a category, then choose Find answers.")
-        ttk.Label(root, text="Record a result / player-reported answer", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        report = ttk.Frame(root)
+        self.results.insert("end", "Enter a prompt or click Detect prompt.")
+        result_actions = ttk.Frame(root)
+        result_actions.pack(fill="x", pady=(0, 6))
+        ttk.Button(result_actions, text="Copy", command=self.copy_selected).pack(side="left", padx=(0, 6))
+        ttk.Button(result_actions, text="Clear", command=self.clear_results).pack(side="left", padx=(0, 6))
+        ttk.Button(result_actions, text="Regenerate", command=self.regenerate).pack(side="right")
+        ttk.Button(result_actions, text="✓ Accepted", command=lambda: self.mark_selected("accepted")).pack(side="left", padx=(0, 6))
+        ttk.Button(result_actions, text="✕ Rejected", command=lambda: self.mark_selected("rejected")).pack(side="left")
+        self.report_expanded = False
+        self.report_toggle = ttk.Button(root, text="Add player report  +", command=self.toggle_report)
+        self.report_toggle.pack(anchor="w", pady=(2, 0))
+        self.report_panel = ttk.Frame(root)
+        report = ttk.Frame(self.report_panel)
         report.pack(fill="x", pady=(5, 0))
         self.answer = tk.StringVar()
         ttk.Entry(report, textvariable=self.answer).grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -226,7 +431,7 @@ class App(tk.Tk):
         ttk.Entry(report, textvariable=self.level, width=14).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(report, text="Save report", command=self.save).grid(row=0, column=3)
         report.columnconfigure(0, weight=1)
-        details = ttk.Frame(root)
+        details = ttk.Frame(self.report_panel)
         details.pack(fill="x", pady=(5, 0))
         self.reporter = tk.StringVar()
         self.note = tk.StringVar()
@@ -236,13 +441,145 @@ class App(tk.Tk):
         ttk.Entry(details, textvariable=self.note).grid(row=1, column=1, sticky="ew")
         details.columnconfigure(0, weight=1)
         details.columnconfigure(1, weight=2)
-        ttk.Label(root, text="Level is optional. Reports are scoped to the selected mode and category.", foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(self.report_panel, text="Level is optional. Reports are scoped to the selected mode and category.", foreground="#555").pack(anchor="w", pady=(4, 0))
         self.bind("<Return>", lambda _event: self.search())
+
+    def toggle_report(self):
+        self.report_expanded = not self.report_expanded
+        if self.report_expanded:
+            self.report_panel.pack(fill="x", pady=(0, 4))
+            self.report_toggle.configure(text="Add player report  −")
+        else:
+            self.report_panel.pack_forget()
+            self.report_toggle.configure(text="Add player report  +")
+
+    def toggle_compact(self):
+        self.compact_mode = not self.compact_mode
+        if self.compact_mode:
+            self.mode_label.grid_remove()
+            self.mode_combo.grid_remove()
+            self.category_label.grid_configure(column=0)
+            self.category_entry.grid_configure(column=0, padx=(0, 8))
+            self.search_button.grid_configure(column=1)
+            self.form.columnconfigure(0, weight=1)
+            self.form.columnconfigure(1, weight=0)
+            self.form.columnconfigure(2, weight=0)
+            self.report_expanded = False
+            self.report_panel.pack_forget()
+            self.report_toggle.pack_forget()
+            self.results.configure(height=3)
+            self.geometry("440x350")
+            self.minsize(420, 330)
+            self.view_button.configure(text="Full view")
+        else:
+            self.mode_label.grid()
+            self.mode_combo.grid()
+            self.category_label.grid_configure(column=1)
+            self.category_entry.grid_configure(column=1, padx=(0, 12))
+            self.search_button.grid_configure(column=2)
+            self.form.columnconfigure(0, weight=0)
+            self.form.columnconfigure(1, weight=1)
+            self.form.columnconfigure(2, weight=0)
+            self.report_toggle.pack(anchor="w", pady=(2, 0), after=self.result_actions)
+            self.results.configure(height=5)
+            self.geometry("560x460")
+            self.minsize(500, 420)
+            self.view_button.configure(text="Compact")
 
     def _toggle_topmost(self):
         self.attributes("-topmost", self.always_on_top.get())
 
-    def search(self):
+    def start_detection(self):
+        if self.browser_thread and self.browser_thread.is_alive():
+            return
+        mode = self.mode.get()
+        self.browser_stop = threading.Event()
+        self.detection_status.set("Starting a separate Chromium browser…")
+        self.detect_button.configure(text="Stop detection")
+        self.browser_thread = threading.Thread(target=self._browser_worker, args=(mode, self.browser_stop), daemon=True)
+        self.browser_thread.start()
+
+    def toggle_detection(self):
+        if self.browser_thread and self.browser_thread.is_alive():
+            self.stop_detection()
+        else:
+            self.start_detection()
+
+    def stop_detection(self):
+        if self.browser_stop:
+            self.browser_stop.set()
+            self.detection_status.set("Stopping browser detection…")
+            self.detect_button.configure(text="Stopping…")
+
+    def close_app(self):
+        if self.browser_thread and self.browser_thread.is_alive() and self.browser_stop:
+            self.browser_stop.set()
+            self.detection_status.set("Closing browser before exit…")
+            self.after(2500, self.destroy)
+        else:
+            self.destroy()
+
+    def _browser_worker(self, mode: str, stop_event: threading.Event):
+        try:
+            from playwright.sync_api import Error as PlaywrightError, sync_playwright
+        except ImportError:
+            self.after(0, self._detection_error, "Playwright is not installed. Run: pip install -r requirements.txt, then py -m playwright install chromium")
+            return
+        profile_dir = DATA_DIR / "browser-profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        url = "https://krillion.io/party" if mode == "Puffer Party" else "https://krillion.io/"
+        try:
+            with sync_playwright() as playwright:
+                context = playwright.chromium.launch_persistent_context(str(profile_dir), headless=False)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                self.after(0, self.detection_status.set, "Watching the game page for a prompt…")
+                last_prompt = ""
+                while not stop_event.is_set():
+                    try:
+                        visible_text = page.locator("body").inner_text(timeout=1200)
+                        prompt = detect_question(visible_text)
+                        if prompt:
+                            if prompt != last_prompt:
+                                last_prompt = prompt
+                                self.after(0, self._prompt_detected, mode, prompt)
+                        else:
+                            last_prompt = ""
+                        page.wait_for_timeout(500)
+                    except PlaywrightError:
+                        if not context.pages:
+                            break
+                        page = context.pages[0]
+                context.close()
+        except Exception as exc:
+            self.after(0, self._detection_error, str(exc))
+            return
+        self.after(0, self.detection_status.set, "Browser detection is stopped.")
+        self.after(0, self.detect_button.configure, {"text": "Detect prompt"})
+
+    def _prompt_detected(self, mode: str, prompt: str):
+        self.mode.set(mode)
+        self.category.set(prompt)
+        self.detection_status.set(f"Detected: {prompt}")
+        if not self.compact_mode:
+            self.toggle_compact()
+        self.search()
+
+    def _detection_error(self, error: str):
+        self.detection_status.set("Browser detection could not start.")
+        self.detect_button.configure(text="Detect prompt")
+        messagebox.showerror("Browser detection", error)
+
+    def regenerate(self):
+        if not self.category.get().strip():
+            messagebox.showinfo("Prompt required", "Enter or detect a prompt before regenerating answers.")
+            return
+        self.search(regenerate=True)
+
+    def search(self, regenerate: bool = False):
+        self.search_generation += 1
+        generation = self.search_generation
+        previous_answers = list(self.result_answers.values()) if regenerate else []
         category = self.category.get().strip()
         if not category:
             messagebox.showinfo("Category required", "Enter a category or prompt first.")
@@ -250,44 +587,96 @@ class App(tk.Tk):
         known = self.store.lookup(self.mode.get(), category)
         lex = self.store.lexicon_answers(category)
         self.results.delete(0, "end")
+        self.result_answers.clear()
         shown = set()
         for row in known:
             label = f"[{row['status'].upper()}] {row['answer']}" + (f" — level: {row['level']}" if row["level"] else "") + (f" — by {row['reporter']}" if row["reporter"] else "")
-            self.results.insert("end", label)
+            self._add_result(label, row["answer"])
             shown.add(normalize(row["answer"]))
         added_lex = 0
         for answer in lex:
-            if normalize(answer) not in shown:
-                self.results.insert("end", f"[LEXICON / UNVERIFIED] {answer}")
+            if candidate_matches_prompt(answer, category) and normalize(answer) not in shown:
+                self._add_result(f"[LEXICON / UNVERIFIED] {answer}", answer)
                 shown.add(normalize(answer)); added_lex += 1
         self.results.insert("end", f"--- {len(known)} stored reports; {added_lex} lexicon suggestions ---")
         useful_answers = {normalize(row["answer"]) for row in known if row["status"] == "accepted"}
-        useful_answers.update(normalize(answer) for answer in lex)
+        useful_answers.update(normalize(answer) for answer in lex if candidate_matches_prompt(answer, category))
         useful_count = len(useful_answers)
-        if self.use_ai.get() and useful_count < 5:
-            self.results.insert("end", "Asking Ollama…")
-            needed = max(3, 8 - useful_count)
+        if regenerate or (self.use_ai.get() and useful_count < 5):
+            self.results.insert("end", "Regenerating AI answers…" if regenerate else "AI candidates (unverified) will appear as they arrive…")
+            needed = max(1, 5 - useful_count)
             blocked = {normalize(row["answer"]) for row in known if row["status"] != "accepted"}
-            ai_known = [answer for answer in shown if normalize(answer) not in blocked]
-            threading.Thread(target=self._ai_worker, args=(category, ai_known, needed, self.mode.get()), daemon=True).start()
+            prior = list(dict.fromkeys(list(shown) + previous_answers))
+            ai_known = [answer for answer in prior if normalize(answer) not in blocked]
+            threading.Thread(target=self._ai_worker, args=(category, ai_known, needed, self.mode.get(), generation, regenerate), daemon=True).start()
         elif not known and not lex:
             self.results.insert("end", "No stored answers or matching lexicon. Enable Ollama or add a player report.")
         elif self.use_ai.get() and useful_count >= 5:
             self.results.insert("end", "AI skipped: lookup already found at least five accepted or lexicon suggestions.")
 
-    def _ai_worker(self, category: str, known: list[str], count: int, mode: str):
-        try:
-            answers = ollama_suggest(category, known, count, mode)
-            self.after(0, lambda: self._show_ai(answers))
-        except Exception as exc:
-            self.after(0, lambda: self.results.insert("end", f"[AI unavailable] {exc}"))
+    def _add_result(self, label: str, answer: str | None = None):
+        index = self.results.size()
+        self.results.insert("end", label)
+        if answer:
+            self.result_answers[index] = answer
 
-    def _show_ai(self, answers: list[str]):
-        self.results.insert("end", "--- AI candidates (unverified; verify before relying on them) ---")
-        for answer in answers:
-            self.results.insert("end", f"[AI / UNVERIFIED] {answer}")
-        if not answers:
-            self.results.insert("end", "Ollama returned no usable candidates.")
+    def _selected_answer(self) -> str | None:
+        selection = self.results.curselection()
+        return self.result_answers.get(selection[0]) if selection else None
+
+    def copy_selected(self):
+        answer = self._selected_answer()
+        if not answer:
+            messagebox.showinfo("Select an answer", "Select an answer row to copy it.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(answer)
+
+    def clear_results(self):
+        self.search_generation += 1
+        self.results.delete(0, "end")
+        self.result_answers.clear()
+
+    def mark_selected(self, status: str):
+        answer = self._selected_answer()
+        category = self.category.get().strip()
+        if not answer or not category:
+            messagebox.showinfo("Select an answer", "Select an answer row to record its result.")
+            return
+        try:
+            reporter = self.reporter.get().strip() or "Local player"
+            self.store.save_report(self.mode.get(), category, answer, status, self.level.get(), reporter, self.note.get())
+            self.search()
+        except Exception as exc:
+            messagebox.showerror("Could not save", str(exc))
+
+    def _ai_worker(self, category: str, known: list[str], count: int, mode: str, generation: int, force: bool = False):
+        try:
+            answers = ollama_suggest(
+                category, known, count, mode,
+                on_candidate=lambda answer, fallback: self.after(0, self._append_ai_candidate, generation, answer, fallback),
+                force=force,
+            )
+            if not answers:
+                self.after(0, self._show_ai_empty, generation)
+        except Exception as exc:
+            self.after(0, self._show_ai_error, generation, str(exc))
+
+    def _append_ai_candidate(self, generation: int, answer: str, fallback: bool):
+        if generation != self.search_generation:
+            return
+        if normalize(answer) in {normalize(value) for value in self.result_answers.values()}:
+            return
+        label = "[AI FALLBACK / UNVERIFIED]" if fallback else "[AI / UNVERIFIED]"
+        self._add_result(f"{label} {answer}", answer)
+
+    def _show_ai_empty(self, generation: int):
+        if generation == self.search_generation:
+            self.results.insert("end", "No AI candidates this time. Click Regenerate to try again.")
+
+    def _show_ai_error(self, generation: int, error: str):
+        if generation == self.search_generation:
+            self.results.insert("end", f"[AI unavailable] {error}")
 
     def save(self):
         category, answer = self.category.get().strip(), self.answer.get().strip()
