@@ -1,0 +1,39 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+.env.*
+!.env.example
+
+# Local application data and SQLite databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Windows and editor/IDE files
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.code-workspace

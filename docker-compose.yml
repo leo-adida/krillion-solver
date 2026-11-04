@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: krillionsolver-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: krillion
+      POSTGRES_USER: krillion
+      POSTGRES_PASSWORD: change-me-local
+    ports:
+      - "5432:5432"
+    volumes:
+      - krillion_pgdata:/var/lib/postgresql/data
+
+volumes:
+  krillion_pgdata:
