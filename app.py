@@ -72,6 +72,38 @@ def detect_question(page_text: str) -> str | None:
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
+def detect_answer_events(page_text: str) -> list[tuple[str, str, str]]:
+    """Extract explicit accepted/rejected answer messages from visible game text."""
+    events: list[tuple[str, str, str]] = []
+    patterns = (
+        (re.compile(r"^(.{1,90}?)\s+(?:was|is)\s+accepted\b", re.I), "accepted", None),
+        (re.compile(r"^(.{1,90}?)\s+(?:was|is)\s+rejected\b", re.I), "rejected", None),
+        (re.compile(r"^(?:accepted|correct)\s*[:\-]\s*(.{1,90})$", re.I), "accepted", None),
+        (re.compile(r"^(?:rejected|incorrect|invalid)\s*[:\-]\s*(.{1,90})$", re.I), "rejected", None),
+        (re.compile(r"^(.{1,90}?)\s*[—–-]\s*(?:accepted|correct)$", re.I), "accepted", None),
+        (re.compile(r"^(.{1,90}?)\s*[—–-]\s*(?:rejected|incorrect|invalid)$", re.I), "rejected", None),
+        (re.compile(r"^(.{1,50}?)\s*:\s*(.{1,70}?)\s*[✓✔]$", re.I), "accepted", "player"),
+        (re.compile(r"^(.{1,50}?)\s*:\s*(.{1,70}?)\s*[✕✖❌]$", re.I), "rejected", "player"),
+    )
+    for raw in page_text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip(" \t•*-–—")
+        if not line or len(line) > 140:
+            continue
+        for pattern, status, _source in patterns:
+            match = pattern.match(line)
+            if match:
+                reporter = None
+                if pattern.groups == 2:
+                    reporter = match.group(1).strip()
+                    answer = match.group(2).strip(" \t:—–-\"'")
+                else:
+                    answer = match.group(1).strip(" \t:—–-\"'")
+                if answer and not re.search(r"\b(?:player|round|answer|turn)\b", answer, re.I):
+                    events.append((answer, status, reporter))
+                break
+    return events
+
+
 COUNTRIES = [
     "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria", "Azerbaijan",
     "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burkina Faso", "Burundi",
@@ -227,10 +259,14 @@ class Store:
             return answers
         return []
 
-    def save_report(self, mode: str, category: str, answer: str, status: str, level: str, reporter: str, note: str) -> None:
+    def save_report(self, mode: str, category: str, answer: str, status: str, level: str, reporter: str, note: str, source: str = "player") -> None:
         pid = self.ensure_prompt(mode, category)
-        self._execute("INSERT INTO answers(prompt_id, answer, normalized_answer, status, level, reporter, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (pid, answer.strip(), normalize(answer), status, level.strip() or None, reporter.strip() or None, note.strip() or None))
+        existing = self._execute("SELECT id FROM answers WHERE prompt_id=? AND normalized_answer=? AND status=? AND COALESCE(reporter, '')=?",
+                                 (pid, normalize(answer), status, reporter.strip())).fetchone()
+        if existing:
+            return
+        self._execute("INSERT INTO answers(prompt_id, answer, normalized_answer, status, level, source, reporter, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (pid, answer.strip(), normalize(answer), status, level.strip() or None, source, reporter.strip() or None, note.strip() or None))
         self.conn.commit()
 
 
@@ -256,7 +292,7 @@ def clean_ai_answer(value: object) -> str | None:
     return answer
 
 
-def ollama_suggest(category: str, known: list[str], count: int = 5, mode: str = "Krillion", on_candidate=None, force: bool = False) -> list[str]:
+def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = "Krillion", on_candidate=None, force: bool = False) -> list[str]:
     endpoint = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     cache_key = (model, mode, normalize(category), count, tuple(sorted(normalize(x) for x in known)))
@@ -266,89 +302,75 @@ def ollama_suggest(category: str, known: list[str], count: int = 5, mode: str = 
             for index, answer in enumerate(cached[1]):
                 on_candidate(answer, index == 0)
         return cached[1]
-    count = max(1, min(count, 5))
-    prompt = (
-        f"For {mode}, answer this category: {category!r}. Return up to {count} answers. "
-        "Use only real, independently existing things that clearly fit. Never invent or embellish names, and do not use Krillion/game terms unless requested. "
-        "For places, name real recognized places; coastal cities must touch a sea, ocean, gulf, or bay. Obey explicit letter rules. "
-        "First answer should be a familiar, low-risk fallback. Omit anything uncertain and do not explain. "
-        "Avoid these known answers: " + ", ".join(known[:20])
-    )
-    output_schema = {
-        "type": "object",
-        "properties": {
-            "answers": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": count,
-            }
-        },
-        "required": ["answers"],
-        "additionalProperties": False,
-    }
-    token_budget = min(64, max(1, int(os.getenv("OLLAMA_NUM_PREDICT", "64"))))
-    payload = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "format": output_schema,
-        "stream": True,
-        "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "10m"),
-        "options": {"num_predict": token_budget, "temperature": 0.2},
-    }).encode("utf-8")
-    req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-    answers = []
-    generated = ""
-    array_cursor: int | None = None
+    count = max(1, min(count, 10))
+    answers: list[str] = []
     decoder = json.JSONDecoder()
 
-    def accept_value(value: object) -> None:
-        answer = clean_ai_answer(value)
-        if answer and candidate_matches_prompt(answer, category) and normalize(answer) not in {normalize(x) for x in known + answers}:
-            answers.append(answer)
-            if on_candidate:
-                on_candidate(answer, len(answers) == 1)
+    def generate_batch(batch_count: int, quick: bool) -> None:
+        prompt = (
+            f"For {mode}, answer this category: {category!r}. Return up to {batch_count} answer strings as JSON. "
+            "Use only real, independently existing things that clearly fit. Never invent names or use game-related words. "
+            "Obey explicit letter rules. Give the most recognizable, low-risk answer first, then valid less common examples. "
+            "Omit uncertain answers. Output answer strings only, with no explanation. Avoid these answers: "
+            + ", ".join((known + answers)[:30])
+        )
+        schema = {"type": "object", "properties": {"answers": {"type": "array", "items": {"type": "string"}, "maxItems": batch_count}}, "required": ["answers"], "additionalProperties": False}
+        payload = json.dumps({
+            "model": model, "prompt": prompt, "format": schema, "stream": True,
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "10m"),
+            "options": {"num_predict": 40 if quick else max(192, 32 * batch_count), "temperature": 0.25},
+        }).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        generated = ""
+        def accept(value: object) -> None:
+            answer = clean_ai_answer(value)
+            if answer and candidate_matches_prompt(answer, category) and normalize(answer) not in {normalize(x) for x in known + answers}:
+                answers.append(answer)
+                if on_candidate:
+                    on_candidate(answer, len(answers) == 1)
 
-    def consume_complete_values() -> None:
-        nonlocal array_cursor
-        if array_cursor is None:
+        def consume() -> None:
             match = re.search(r'"answers"\s*:\s*\[', generated)
             if not match:
                 return
-            array_cursor = match.end()
-        while array_cursor < len(generated):
-            while array_cursor < len(generated) and (generated[array_cursor].isspace() or generated[array_cursor] == ","):
-                array_cursor += 1
-            if array_cursor >= len(generated) or generated[array_cursor] == "]":
-                return
-            try:
-                value, end = decoder.raw_decode(generated, array_cursor)
-            except json.JSONDecodeError:
-                return
-            array_cursor = end
-            accept_value(value)
+            cursor = match.end()
+            while cursor < len(generated):
+                while cursor < len(generated) and (generated[cursor].isspace() or generated[cursor] == ","):
+                    cursor += 1
+                if cursor >= len(generated) or generated[cursor] == "]":
+                    return
+                try:
+                    value, cursor = decoder.raw_decode(generated, cursor)
+                except json.JSONDecodeError:
+                    return
+                before = len(answers)
+                accept(value)
+                if len(answers) == before:
+                    continue
 
-    with urllib.request.urlopen(req, timeout=45) as response:
-        for raw_line in response:
-            if not raw_line.strip():
-                continue
-            stream_item = json.loads(raw_line.decode("utf-8"))
-            if stream_item.get("error"):
-                raise RuntimeError(stream_item["error"])
-            generated += stream_item.get("response", "")
-            consume_complete_values()
-            if len(answers) >= min(count, 10):
-                break
-    try:
-        parsed = json.loads(generated)
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), list):
-            raise ValueError("Ollama response did not contain an answers list")
-        if not answers:
-            for value in parsed["answers"][:count]:
-                accept_value(value)
-    except json.JSONDecodeError as exc:
-        if not answers:
-            raise RuntimeError("Ollama did not return the required answer-only JSON") from exc
-    answers = answers[:count]
+        with urllib.request.urlopen(req, timeout=90) as response:
+            for raw_line in response:
+                if not raw_line.strip():
+                    continue
+                item = json.loads(raw_line.decode("utf-8"))
+                if item.get("error"):
+                    raise RuntimeError(item["error"])
+                generated += item.get("response", "")
+                consume()
+        try:
+            parsed = json.loads(generated)
+            for value in parsed.get("answers", []):
+                if len(answers) >= count:
+                    break
+                accept(value)
+        except (json.JSONDecodeError, AttributeError):
+            if not answers:
+                raise RuntimeError("Ollama did not return the required answer-only JSON")
+
+    # The first short generation gives the UI an early fallback; the second expands it.
+    generate_batch(1, quick=True)
+    if len(answers) < count:
+        generate_batch(count - len(answers), quick=False)
     AI_CACHE[cache_key] = (time.time(), answers)
     return answers
 
@@ -367,6 +389,10 @@ class App(tk.Tk):
             return
         self.search_generation = 0
         self.result_answers: dict[int, str] = {}
+        self.ai_answers: set[str] = set()
+        self.ai_feedback_done: set[str] = set()
+        self.ai_feedback_since_refresh = 0
+        self.ai_feedback_threshold = 2
         self.browser_thread: threading.Thread | None = None
         self.browser_stop: threading.Event | None = None
         self._build()
@@ -535,6 +561,7 @@ class App(tk.Tk):
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 self.after(0, self.detection_status.set, "Watching the game page for a prompt…")
                 last_prompt = ""
+                seen_events: set[tuple[str, str, str]] = set()
                 while not stop_event.is_set():
                     try:
                         visible_text = page.locator("body").inner_text(timeout=1200)
@@ -543,6 +570,11 @@ class App(tk.Tk):
                             if prompt != last_prompt:
                                 last_prompt = prompt
                                 self.after(0, self._prompt_detected, mode, prompt)
+                            for answer, status, reporter in detect_answer_events(visible_text):
+                                event = (normalize(prompt), normalize(answer), status)
+                                if event not in seen_events:
+                                    seen_events.add(event)
+                                    self.after(0, self._save_detected_answer, mode, prompt, answer, status, reporter)
                         else:
                             last_prompt = ""
                         page.wait_for_timeout(500)
@@ -564,6 +596,16 @@ class App(tk.Tk):
         if not self.compact_mode:
             self.toggle_compact()
         self.search()
+
+    def _save_detected_answer(self, mode: str, prompt: str, answer: str, status: str, reporter: str | None):
+        try:
+            self.store.save_report(
+                mode, prompt, answer, status, "", reporter or "Game detected", "Detected from visible game feedback", "game_detected",
+            )
+            if self.mode.get() == mode and normalize(self.category.get()) == normalize(prompt):
+                self.search()
+        except Exception as exc:
+            self.detection_status.set(f"Could not save game feedback: {exc}")
 
     def _detection_error(self, error: str):
         self.detection_status.set("Browser detection could not start.")
@@ -588,8 +630,11 @@ class App(tk.Tk):
         lex = self.store.lexicon_answers(category)
         self.results.delete(0, "end")
         self.result_answers.clear()
+        self.ai_answers.clear()
         shown = set()
         for row in known:
+            if row["status"] == "rejected":
+                continue
             label = f"[{row['status'].upper()}] {row['answer']}" + (f" — level: {row['level']}" if row["level"] else "") + (f" — by {row['reporter']}" if row["reporter"] else "")
             self._add_result(label, row["answer"])
             shown.add(normalize(row["answer"]))
@@ -604,10 +649,10 @@ class App(tk.Tk):
         useful_count = len(useful_answers)
         if regenerate or (self.use_ai.get() and useful_count < 5):
             self.results.insert("end", "Regenerating AI answers…" if regenerate else "AI candidates (unverified) will appear as they arrive…")
-            needed = max(1, 5 - useful_count)
+            needed = 8 if regenerate else max(1, 8 - useful_count)
             blocked = {normalize(row["answer"]) for row in known if row["status"] != "accepted"}
             prior = list(dict.fromkeys(list(shown) + previous_answers))
-            ai_known = [answer for answer in prior if normalize(answer) not in blocked]
+            ai_known = prior + [row["answer"] for row in known if normalize(row["answer"]) in blocked]
             threading.Thread(target=self._ai_worker, args=(category, ai_known, needed, self.mode.get(), generation, regenerate), daemon=True).start()
         elif not known and not lex:
             self.results.insert("end", "No stored answers or matching lexicon. Enable Ollama or add a player report.")
@@ -638,6 +683,8 @@ class App(tk.Tk):
         self.result_answers.clear()
 
     def mark_selected(self, status: str):
+        selection = self.results.curselection()
+        index = selection[0] if selection else None
         answer = self._selected_answer()
         category = self.category.get().strip()
         if not answer or not category:
@@ -646,7 +693,27 @@ class App(tk.Tk):
         try:
             reporter = self.reporter.get().strip() or "Local player"
             self.store.save_report(self.mode.get(), category, answer, status, self.level.get(), reporter, self.note.get())
-            self.search()
+            is_ai_answer = normalize(answer) in self.ai_answers
+            if is_ai_answer and normalize(answer) not in self.ai_feedback_done:
+                self.ai_feedback_done.add(normalize(answer))
+                self.ai_feedback_since_refresh += 1
+            if index is not None:
+                if status == "rejected":
+                    self.results.delete(index)
+                    self.result_answers = {
+                        old_index - (old_index > index): value
+                        for old_index, value in self.result_answers.items()
+                        if old_index != index
+                    }
+                    self.ai_answers.discard(normalize(answer))
+                else:
+                    self.results.delete(index)
+                    self.results.insert(index, f"[ACCEPTED] {answer}")
+                    self.results.selection_set(index)
+            if is_ai_answer and self.ai_feedback_since_refresh >= self.ai_feedback_threshold:
+                self.ai_feedback_since_refresh = 0
+                self.ai_feedback_threshold = 3 if self.ai_feedback_threshold == 2 else 2
+                self.search(regenerate=True)
         except Exception as exc:
             messagebox.showerror("Could not save", str(exc))
 
@@ -669,6 +736,7 @@ class App(tk.Tk):
             return
         label = "[AI FALLBACK / UNVERIFIED]" if fallback else "[AI / UNVERIFIED]"
         self._add_result(f"{label} {answer}", answer)
+        self.ai_answers.add(normalize(answer))
 
     def _show_ai_empty(self, generation: int):
         if generation == self.search_generation:
