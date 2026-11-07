@@ -35,7 +35,7 @@ def normalize(text: str) -> str:
 
 
 def candidate_matches_prompt(answer: str, prompt: str) -> bool:
-    """Enforce clear letter constraints; leave less explicit rules to the model/player."""
+    """Reject suggestions that violate simple, explicit prompt constraints."""
     text = prompt.casefold()
     candidate = answer.strip().casefold()
     first_letter = re.search(r"\b(?:start(?:s|ing)?|begin(?:s|ning)?)\s+with\s+(?:the\s+)?(?:letter\s+)?['\"]?([a-z])\b", text)
@@ -47,29 +47,129 @@ def candidate_matches_prompt(answer: str, prompt: str) -> bool:
         return False
     if contains_letter and contains_letter.group(1) not in candidate:
         return False
+    counts = {"one": 1, "1": 1, "two": 2, "2": 2, "three": 3, "3": 3, "four": 4, "4": 4}
+    word_range = re.search(r"\b(one|1|two|2|three|3)\s+or\s+(one|1|two|2|three|3)\s+words?\b", text)
+    word_count = re.search(r"\b(?:exactly\s+)?(?:(one|1|two|2|three|3|four|4)[- ]words?|single[- ]words?)\b", text)
+    answer_word_count = len(candidate.split())
+    if word_range and answer_word_count not in {counts[word_range.group(1)], counts[word_range.group(2)]}:
+        return False
+    if word_count and answer_word_count != (counts[word_count.group(1)] if word_count.group(1) else 1):
+        return False
+    syllable_rule = re.search(r"\b(?:exactly\s+)?(\d+)\s+syllables?\b", text)
+    if syllable_rule and not candidate_syllables_match(candidate, int(syllable_rule.group(1))):
+        return False
+    if re.search(r"\bcompound\s+words?\b", text) and not looks_compound(candidate):
+        return False
+    if not country_constraint_matches(answer, prompt):
+        return False
+    excluded = re.search(r"\b(?:not|excluding|except|without)\s+([a-z][a-z -]{1,35})", text)
+    if not excluded:
+        excluded = re.search(r"\b([a-z][a-z -]{1,35}?)\s+(?:does not|doesn't|do not|don't)\s+count\b", text)
+    if excluded:
+        excluded_text = excluded.group(1)
+        excluded_terms = {normalize(part) for part in re.split(r",|\bor\b|\band\b", excluded_text)}
+        if normalize(candidate) in excluded_terms:
+            return False
     return True
+
+
+CMU_PRONUNCIATIONS = None
+CMU_LOAD_ATTEMPTED = False
+
+
+def candidate_syllables_match(answer: str, expected: int) -> bool:
+    """Use CMU pronunciations when installed; avoid guessing if a word is unknown."""
+    global CMU_PRONUNCIATIONS, CMU_LOAD_ATTEMPTED
+    if not CMU_LOAD_ATTEMPTED:
+        CMU_LOAD_ATTEMPTED = True
+        try:
+            import cmudict
+            CMU_PRONUNCIATIONS = cmudict.dict()
+        except ImportError:
+            CMU_PRONUNCIATIONS = {}
+    pronunciations = CMU_PRONUNCIATIONS
+    if not pronunciations:
+        return True
+    counts = []
+    for word in re.findall(r"[a-z']+", answer.casefold()):
+        entries = pronunciations.get(word)
+        if not entries:
+            return True
+        counts.append(min(sum(phoneme[-1:].isdigit() for phoneme in entry) for entry in entries))
+    return bool(counts) and sum(counts) == expected
+
+
+def looks_compound(answer: str) -> bool:
+    normalized = normalize(answer)
+    return "-" in answer or normalized in {
+        "sunflower", "toothbrush", "rainbow", "notebook", "football", "basketball",
+        "bedroom", "airport", "popcorn", "snowman", "butterfly", "firefly", "moonlight",
+        "ice cream", "hot dog", "post office", "high school", "living room", "coffee table",
+        "fire truck", "parking lot", "swimming pool", "washing machine", "ice cube", "mailbox",
+    }
+
+
+def extract_visible_answer_lines(page_text: str, prompt: str) -> set[str]:
+    """Collect short standalone text rows that may be answers already on the game page."""
+    visible: set[str] = set()
+    skip = re.compile(r"^(?:question(?:\s+\d+)?|prompt|category|round(?:\s+\d+)?|timer|score|players?|submit|start game|settings|leave game|waiting(?: for players)?|your turn)$", re.I)
+    for raw_line in page_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" \t•*-0123456789.)\t")
+        candidate = line.split(":", 1)[1].strip() if ":" in line else line
+        candidate = re.sub(r"\s+(?:accepted|correct|rejected|incorrect|invalid)\s*$", "", candidate, flags=re.I)
+        candidate = re.sub(r"^\[(?:accepted|correct|rejected|incorrect|invalid)\]\s*", "", candidate, flags=re.I)
+        candidate = re.sub(r"^[\u2713\u2714\u2715\u2716\u274c\s]+", "", candidate)
+        candidate = re.sub(r"[\s\u2713\u2714\u2715\u2716\u274c]+$", "", candidate).strip()
+        if not candidate or len(candidate) > 90 or normalize(candidate) == normalize(prompt) or skip.search(candidate):
+            continue
+        if re.match(r"^(?:name|list|give|think of|come up with|say|tell me|identify|which|what|who|where|when|how)\b", candidate, re.I):
+            continue
+        visible.add(normalize(candidate))
+    return {value for value in visible if value}
 
 
 def detect_question(page_text: str) -> str | None:
     """Find a likely standalone game prompt in visible browser text."""
-    direct = re.compile(r"^(?:name|list|give|think of|come up with|say|tell me|identify|which|what|who|where|when|how)\b", re.I)
+    direct = re.compile(r"^(?:name|list|give(?: me)?|think of|come up with|say|tell me|identify|which|what|who|where|when|how)\b", re.I)
+    rule_prompt = re.compile(r"\b(?:that|which)\s+(?:start|begin|end|contain|include|have|is|are)\b|\b(?:starting|beginning|ending|containing)\s+with\b", re.I)
+    category_prompt = re.compile(
+        r"^(?:(?:name|list|give)\s+)?(?:a|an|any|some|all)?\s*(?:coastal|seaside)?\s*"
+        r"(?:cities|city|countries|country|nations|animals|animal|foods|food|fruits|fruit|vegetables|sports|"
+        r"planets|continents|oceans|colors|colours|musical instruments|jobs|occupations|vehicles|plants|gemstones|dinosaurs|board games)\b",
+        re.I,
+    )
     candidates: list[tuple[int, str]] = []
     for raw_line in page_text.splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip(" \t•*-–—")
         line = re.sub(r"^(?:question|prompt|category)(?:\s*\d+)?\s*[:：-]\s*", "", line, flags=re.I)
         line = re.sub(r"^\d+[.)]\s*", "", line)
-        if not 8 <= len(line) <= 180:
+        if not 5 <= len(line) <= 220:
             continue
-        if not direct.match(line):
+        if not (direct.match(line) or rule_prompt.search(line) or category_prompt.match(line)):
             continue
         # Ignore instructions/help text; these tend to be full explanatory sentences.
         if re.search(r"\b(?:press|click|type|enter|submit|timer|round starts|take turns)\b", line, re.I):
             continue
-        score = 2 if re.match(r"^(?:name|list|give|think of|come up with)\b", line, re.I) else 1
+        score = 3 if direct.match(line) else 1
+        if rule_prompt.search(line):
+            score += 1
         if line.endswith("?"):
             score += 1
         candidates.append((score, line.rstrip(".!? ")))
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def detect_page_question(page, page_text: str) -> tuple[str | None, str]:
+    """Check likely prompt containers before falling back to all visible page text."""
+    selector = "[data-testid*='prompt' i], [class*='prompt' i], [class*='question' i], h1, h2, h3, [role='heading']"
+    try:
+        selected_text = "\n".join(page.locator(selector).all_inner_texts())
+        prompt = detect_question(selected_text)
+        if prompt:
+            return prompt, "Prompt or heading elements"
+    except Exception:
+        pass
+    return detect_question(page_text), "Visible page text"
 
 
 def detect_answer_events(page_text: str) -> list[tuple[str, str, str]]:
@@ -159,7 +259,53 @@ LEXICON = {
     "days of the week": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
     "common animals": ["Dog", "Cat", "Horse", "Cow", "Sheep", "Goat", "Pig", "Lion", "Tiger", "Elephant", "Giraffe", "Zebra", "Dolphin", "Whale", "Eagle", "Penguin", "Shark", "Octopus"],
     "common foods": ["Apple", "Banana", "Bread", "Cheese", "Chocolate", "Pizza", "Rice", "Pasta", "Potato", "Tomato", "Carrot", "Chicken", "Salmon", "Egg", "Yogurt"],
+    "fruits": ["Apple", "Apricot", "Banana", "Blackberry", "Blueberry", "Cherry", "Coconut", "Cranberry", "Grape", "Grapefruit", "Guava", "Kiwi", "Lemon", "Lime", "Mango", "Melon", "Nectarine", "Orange", "Papaya", "Peach", "Pear", "Pineapple", "Plum", "Raspberry", "Strawberry", "Watermelon"],
+    "vegetables": ["Artichoke", "Asparagus", "Beet", "Bell pepper", "Broccoli", "Cabbage", "Carrot", "Cauliflower", "Celery", "Corn", "Cucumber", "Eggplant", "Garlic", "Kale", "Lettuce", "Mushroom", "Onion", "Pea", "Potato", "Pumpkin", "Radish", "Spinach", "Squash", "Sweet potato", "Tomato", "Zucchini"],
+    "sports": ["Archery", "Badminton", "Baseball", "Basketball", "Boxing", "Cricket", "Cycling", "Fencing", "Football", "Golf", "Gymnastics", "Hockey", "Ice hockey", "Lacrosse", "Rugby", "Sailing", "Soccer", "Softball", "Swimming", "Tennis", "Track and field", "Volleyball", "Wrestling"],
+    "musical instruments": ["Accordion", "Banjo", "Bass guitar", "Cello", "Clarinet", "Drums", "Flute", "French horn", "Guitar", "Harp", "Harmonica", "Oboe", "Piano", "Saxophone", "Trombone", "Trumpet", "Tuba", "Ukulele", "Viola", "Violin"],
+    "occupations": ["Accountant", "Actor", "Architect", "Baker", "Carpenter", "Chef", "Dentist", "Doctor", "Electrician", "Farmer", "Firefighter", "Judge", "Mechanic", "Nurse", "Paramedic", "Pilot", "Plumber", "Police officer", "Teacher", "Writer"],
+    "vehicles": ["Ambulance", "Bicycle", "Boat", "Bus", "Car", "Ferry", "Helicopter", "Motorcycle", "Pickup truck", "Sailboat", "School bus", "Ship", "Submarine", "Taxi", "Tractor", "Train", "Truck", "Van"],
+    "plants": ["Bamboo", "Cactus", "Daisy", "Fern", "Maple", "Oak", "Orchid", "Pine", "Rose", "Sunflower", "Tulip", "Venus flytrap", "Willow"],
+    "gemstones": ["Agate", "Amethyst", "Aquamarine", "Diamond", "Emerald", "Garnet", "Jade", "Moonstone", "Opal", "Pearl", "Peridot", "Ruby", "Sapphire", "Topaz", "Turquoise"],
+    "board games": ["Backgammon", "Battleship", "Checkers", "Chess", "Clue", "Connect Four", "Go", "Monopoly", "Othello", "Risk", "Scrabble", "Sorry!", "The Game of Life", "Ticket to Ride"],
+    "dinosaurs": ["Allosaurus", "Ankylosaurus", "Apatosaurus", "Brachiosaurus", "Diplodocus", "Iguanodon", "Pachycephalosaurus", "Stegosaurus", "Triceratops", "Tyrannosaurus rex", "Velociraptor"],
+    "body parts": ["Ankle", "Arm", "Back", "Brain", "Chest", "Chin", "Ear", "Elbow", "Eye", "Finger", "Foot", "Hand", "Heart", "Knee", "Leg", "Lung", "Mouth", "Nose", "Shoulder", "Toe", "Tongue", "Wrist"],
+    "interjections": ["Aha", "Ahoy", "Aww", "Bravo", "Eek", "Hooray", "Hmm", "Oops", "Ouch", "Phew", "Uh-oh", "Whoa", "Wow", "Yikes", "Yippee"],
+    "filler words": ["Actually", "Basically", "Like", "Literally", "Perhaps", "Probably", "Really", "Seriously", "So", "Well", "You know"],
 }
+
+COASTAL_COUNTRIES = {country.strip() for country in """
+Albania|Algeria|Angola|Antigua and Barbuda|Argentina|Australia|Bahamas|Bahrain|Bangladesh|Barbados|Belgium|Belize|Benin|Bosnia and Herzegovina|Brazil|Brunei|Cambodia|Cameroon|Canada|Chile|China|Colombia|Comoros|Costa Rica|Côte d'Ivoire|Croatia|Cuba|Cyprus|Denmark|Djibouti|Dominica|Dominican Republic|Ecuador|Egypt|El Salvador|Equatorial Guinea|Eritrea|Estonia|Fiji|Finland|France|Gabon|Gambia|Georgia|Germany|Ghana|Greece|Grenada|Guatemala|Guinea|Guyana|Haiti|Honduras|Iceland|India|Indonesia|Iran|Iraq|Ireland|Israel|Italy|Jamaica|Japan|Jordan|Kenya|Kiribati|Kuwait|Lebanon|Liberia|Libya|Madagascar|Malaysia|Maldives|Malta|Marshall Islands|Mauritania|Mauritius|Mexico|Micronesia|Monaco|Montenegro|Morocco|Mozambique|Myanmar|Namibia|Nauru|Netherlands|New Zealand|Nicaragua|Nigeria|North Korea|Norway|Oman|Pakistan|Palau|Palestine|Panama|Papua New Guinea|Peru|Philippines|Poland|Portugal|Qatar|Republic of the Congo|Romania|Russia|Samoa|Sao Tome and Principe|Saudi Arabia|Senegal|Sierra Leone|Singapore|Slovenia|Solomon Islands|Somalia|South Africa|South Korea|Spain|Sri Lanka|Sudan|Suriname|Sweden|Syria|Taiwan|Tanzania|Thailand|Timor-Leste|Togo|Tonga|Trinidad and Tobago|Tunisia|Turkey|Tuvalu|Ukraine|United Arab Emirates|United Kingdom|United States|Uruguay|Vanuatu|Venezuela|Vietnam|Yemen
+""".split("|") if country.strip()}
+
+COUNTRY_REGIONS = {
+    "europe": set("Albania|Andorra|Austria|Belarus|Belgium|Bosnia and Herzegovina|Bulgaria|Croatia|Cyprus|Czechia|Denmark|Estonia|Finland|France|Germany|Greece|Hungary|Iceland|Ireland|Italy|Kosovo|Latvia|Liechtenstein|Lithuania|Luxembourg|Malta|Moldova|Monaco|Montenegro|Netherlands|North Macedonia|Norway|Poland|Portugal|Romania|Russia|San Marino|Serbia|Slovakia|Slovenia|Spain|Sweden|Switzerland|Ukraine|United Kingdom|Vatican City".split("|")),
+    "africa": set("Algeria|Angola|Benin|Botswana|Burkina Faso|Burundi|Cabo Verde|Cameroon|Central African Republic|Chad|Comoros|Democratic Republic of the Congo|Republic of the Congo|Côte d'Ivoire|Djibouti|Egypt|Equatorial Guinea|Eritrea|Eswatini|Ethiopia|Gabon|Gambia|Ghana|Guinea|Guinea-Bissau|Kenya|Lesotho|Liberia|Libya|Madagascar|Malawi|Mali|Mauritania|Mauritius|Morocco|Mozambique|Namibia|Niger|Nigeria|Rwanda|Sao Tome and Principe|Senegal|Seychelles|Sierra Leone|Somalia|South Africa|South Sudan|Sudan|Tanzania|Togo|Tunisia|Uganda|Zambia|Zimbabwe".split("|")),
+    "asia": set("Afghanistan|Armenia|Azerbaijan|Bahrain|Bangladesh|Bhutan|Brunei|Cambodia|China|Cyprus|Georgia|India|Indonesia|Iran|Iraq|Israel|Japan|Jordan|Kazakhstan|Kuwait|Kyrgyzstan|Laos|Lebanon|Malaysia|Maldives|Mongolia|Myanmar|Nepal|North Korea|Oman|Pakistan|Palestine|Philippines|Qatar|Russia|Saudi Arabia|Singapore|South Korea|Sri Lanka|Syria|Taiwan|Tajikistan|Thailand|Timor-Leste|Turkey|Turkmenistan|United Arab Emirates|Uzbekistan|Vietnam|Yemen".split("|")),
+    "north america": set("Antigua and Barbuda|Bahamas|Barbados|Belize|Canada|Costa Rica|Cuba|Dominica|Dominican Republic|El Salvador|Grenada|Guatemala|Haiti|Honduras|Jamaica|Mexico|Nicaragua|Panama|Saint Kitts and Nevis|Saint Lucia|Saint Vincent and the Grenadines|Trinidad and Tobago|United States".split("|")),
+    "south america": set("Argentina|Bolivia|Brazil|Chile|Colombia|Ecuador|Guyana|Paraguay|Peru|Suriname|Uruguay|Venezuela".split("|")),
+    "oceania": set("Australia|Fiji|Kiribati|Marshall Islands|Micronesia|Nauru|New Zealand|Palau|Papua New Guinea|Samoa|Solomon Islands|Tonga|Tuvalu|Vanuatu".split("|")),
+}
+
+
+def country_constraint_matches(answer: str, prompt: str) -> bool:
+    text = normalize(prompt)
+    if not re.search(r"\b(?:countries?|nations?)\b", text):
+        return True
+    normalized = normalize(answer)
+    canonical = next((country for country in COUNTRIES if normalize(country) == normalized), None)
+    if canonical is None:
+        canonical = next((country for country, aliases in COUNTRY_ALIASES.items() if normalized in {normalize(alias) for alias in aliases}), None)
+    if canonical is None:
+        return not re.search(r"\b(?:coastal|coastline|landlocked|europe|africa|asia|north america|south america|oceania)\b", text)
+    if re.search(r"\b(?:coastal|coastline|by sea|on ocean)\b", text) and canonical not in COASTAL_COUNTRIES:
+        return False
+    if re.search(r"\blandlocked\b", text) and canonical in COASTAL_COUNTRIES:
+        return False
+    for region, members in COUNTRY_REGIONS.items():
+        if re.search(rf"\b{re.escape(region)}\b", text) and canonical not in members:
+            return False
+    return True
 
 
 class Store:
@@ -237,22 +383,52 @@ class Store:
     def lexicon_answers(self, category: str) -> list[str]:
         cat = normalize(category)
         topic_map = {normalize(topic): topic for topic in LEXICON}
+        topic_map.update({
+            "animals": "common animals", "animal": "common animals",
+            "food": "common foods", "foods": "common foods",
+            "instrument": "musical instruments", "instruments": "musical instruments",
+            "occupation": "occupations", "jobs": "occupations", "professions": "occupations",
+            "vehicle": "vehicles", "fruit": "fruits", "vegetable": "vegetables",
+            "plant": "plants", "sport": "sports", "gemstone": "gemstones",
+            "dinosaur": "dinosaurs", "board game": "board games",
+            "body part": "body parts", "body parts": "body parts",
+        })
         topic = topic_map.get(cat)
+        if not topic:
+            topic_terms = (
+                (r"\b(?:animals?|mammals?|birds?|fish)\b", "common animals"),
+                (r"\b(?:foods?|meals?|things to eat)\b", "common foods"),
+                (r"\bfruits?\b", "fruits"), (r"\bvegetables?\b", "vegetables"),
+                (r"\bsports?\b", "sports"), (r"\bmusical instruments?\b", "musical instruments"),
+                (r"\b(?:jobs?|occupations?|professions?)\b", "occupations"),
+                (r"\bvehicles?\b", "vehicles"), (r"\bplants?\b", "plants"),
+                (r"\bgemstones?\b", "gemstones"), (r"\bdinosaurs?\b", "dinosaurs"),
+                (r"\bboard games?\b", "board games"), (r"\bbody parts?\b", "body parts"),
+                (r"\binterjections?\b", "interjections"), (r"\bfiller words?\b", "filler words"),
+            )
+            topic = next((value for pattern, value in topic_terms if re.search(pattern, cat)), None)
         if not topic and re.search(r"\b(?:coastal|seaside)\s+cit(?:y|ies)\b", cat):
             topic = "coastal cities"
-        country_prompt = re.fullmatch(
-            r"(?:(?:name|list|give|think of|identify)\s+)?(?:(?:a|an|any|one|all|some)\s+)?(?:countr(?:y|ies)|nation(?:s)?)"
-            r"(?:\s+(?:that\s+)?(?:whose\s+name\s+)?(?:start(?:s|ing)?|begin(?:s|ning)?|end(?:s|ing)?|contain(?:s|ing)\s+(?:the\s+)?letter)\b.*)?",
-            cat,
-        )
+        country_prompt = bool(re.search(r"\b(?:countr(?:y|ies)|nations?)\b", cat))
         if not topic and country_prompt:
             topic = "countries"
         if topic:
             rows = self._execute("SELECT answer, aliases FROM lexicon WHERE topic=? ORDER BY answer", (topic,)).fetchall()
             answers: list[str] = []
+            country_answers = [row["answer"] if isinstance(row, dict) else row[0] for row in rows]
+            if topic == "countries":
+                if re.search(r"\b(?:coastal|coastline|by (?:the )?sea|on (?:an? )?ocean)\b", cat):
+                    country_answers = [answer for answer in country_answers if answer in COASTAL_COUNTRIES]
+                elif re.search(r"\blandlocked\b", cat):
+                    country_answers = [answer for answer in country_answers if answer not in COASTAL_COUNTRIES]
+                for region, members in COUNTRY_REGIONS.items():
+                    if re.search(rf"\b{re.escape(region)}\b", cat):
+                        country_answers = [answer for answer in country_answers if answer in members]
             for row in rows:
                 answer = row["answer"] if isinstance(row, dict) else row[0]
                 aliases = row["aliases"] if isinstance(row, dict) else row[1]
+                if answer not in country_answers:
+                    continue
                 answers.append(answer)
                 if aliases:
                     answers.extend(alias for alias in aliases.split("|") if alias)
@@ -292,10 +468,11 @@ def clean_ai_answer(value: object) -> str | None:
     return answer
 
 
-def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = "Krillion", on_candidate=None, force: bool = False) -> list[str]:
+def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = "Krillion", on_candidate=None, force: bool = False, cancel_event: threading.Event | None = None, hints: list[str] | None = None) -> list[str]:
     endpoint = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
-    cache_key = (model, mode, normalize(category), count, tuple(sorted(normalize(x) for x in known)))
+    hints = hints or []
+    cache_key = (model, mode, normalize(category), count, tuple(sorted(normalize(x) for x in known)), tuple(sorted(normalize(x) for x in hints)))
     cached = AI_CACHE.get(cache_key)
     if not force and cached and time.time() - cached[0] < AI_CACHE_TTL:
         if on_candidate:
@@ -307,18 +484,25 @@ def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = 
     decoder = json.JSONDecoder()
 
     def generate_batch(batch_count: int, quick: bool) -> None:
+        if cancel_event and cancel_event.is_set():
+            return
         prompt = (
             f"For {mode}, answer this category: {category!r}. Return up to {batch_count} answer strings as JSON. "
             "Use only real, independently existing things that clearly fit. Never invent names or use game-related words. "
-            "Obey explicit letter rules. Give the most recognizable, low-risk answer first, then valid less common examples. "
-            "Omit uncertain answers. Output answer strings only, with no explanation. Avoid these answers: "
+            "For coastal cities, use real cities that touch a sea, ocean, gulf, or bay. Obey explicit letter, word-count, syllable, and compound-word rules. "
+            "Give the most recognizable, low-risk answer first, then valid less common examples. "
+            "Omit uncertain answers. Output answer strings only, with no explanation. Local category examples (do not repeat): "
+            + ", ".join(hints[:30]) + ". Avoid these answers: "
             + ", ".join((known + answers)[:30])
         )
         schema = {"type": "object", "properties": {"answers": {"type": "array", "items": {"type": "string"}, "maxItems": batch_count}}, "required": ["answers"], "additionalProperties": False}
+        options = {"temperature": 0.25}
+        if quick:
+            options["num_predict"] = 40
         payload = json.dumps({
             "model": model, "prompt": prompt, "format": schema, "stream": True,
             "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "10m"),
-            "options": {"num_predict": 40 if quick else max(192, 32 * batch_count), "temperature": 0.25},
+            "options": options,
         }).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         generated = ""
@@ -349,14 +533,33 @@ def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = 
                     continue
 
         with urllib.request.urlopen(req, timeout=90) as response:
-            for raw_line in response:
-                if not raw_line.strip():
-                    continue
-                item = json.loads(raw_line.decode("utf-8"))
-                if item.get("error"):
-                    raise RuntimeError(item["error"])
-                generated += item.get("response", "")
-                consume()
+            stream_finished = threading.Event()
+
+            def close_stream_on_cancel():
+                while not stream_finished.wait(0.1):
+                    if cancel_event and cancel_event.is_set():
+                        response.close()
+                        return
+
+            if cancel_event:
+                threading.Thread(target=close_stream_on_cancel, daemon=True).start()
+            try:
+                for raw_line in response:
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    if not raw_line.strip():
+                        continue
+                    item = json.loads(raw_line.decode("utf-8"))
+                    if item.get("error"):
+                        raise RuntimeError(item["error"])
+                    generated += item.get("response", "")
+                    consume()
+            except Exception:
+                if cancel_event and cancel_event.is_set():
+                    return
+                raise
+            finally:
+                stream_finished.set()
         try:
             parsed = json.loads(generated)
             for value in parsed.get("answers", []):
@@ -369,8 +572,10 @@ def ollama_suggest(category: str, known: list[str], count: int = 8, mode: str = 
 
     # The first short generation gives the UI an early fallback; the second expands it.
     generate_batch(1, quick=True)
-    if len(answers) < count:
+    if len(answers) < count and not (cancel_event and cancel_event.is_set()):
         generate_batch(count - len(answers), quick=False)
+    if cancel_event and cancel_event.is_set():
+        return answers
     AI_CACHE[cache_key] = (time.time(), answers)
     return answers
 
@@ -393,8 +598,14 @@ class App(tk.Tk):
         self.ai_feedback_done: set[str] = set()
         self.ai_feedback_since_refresh = 0
         self.ai_feedback_threshold = 2
+        self.ai_cancel_event: threading.Event | None = None
+        self.visible_game_answers: set[str] = set()
+        self.visible_game_prompt: tuple[str, str] | None = None
         self.browser_thread: threading.Thread | None = None
         self.browser_stop: threading.Event | None = None
+        self.diagnostics_window = None
+        self.diagnostics_text = None
+        self.diagnostics_state = {"URL": "Not connected", "Detection method": "Not running", "Selected prompt": "None", "Browser error": "None", "Extracted page text": ""}
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
@@ -429,6 +640,7 @@ class App(tk.Tk):
         browser_controls.pack(fill="x", pady=(8, 0))
         self.detect_button = ttk.Button(browser_controls, text="Detect prompt", command=self.toggle_detection)
         self.detect_button.pack(side="left", padx=(0, 8))
+        ttk.Button(browser_controls, text="Diagnostics", command=self.show_diagnostics).pack(side="left", padx=(0, 8))
         self.detection_status = tk.StringVar(value="Browser detection is stopped.")
         ttk.Label(browser_controls, textvariable=self.detection_status, foreground="#555").pack(side="left", fill="x", expand=True)
         self.use_ai = tk.BooleanVar(value=False)
@@ -515,9 +727,51 @@ class App(tk.Tk):
     def _toggle_topmost(self):
         self.attributes("-topmost", self.always_on_top.get())
 
+    def show_diagnostics(self):
+        if self.diagnostics_window and self.diagnostics_window.winfo_exists():
+            self.diagnostics_window.lift()
+            return
+        window = tk.Toplevel(self)
+        window.title("Prompt detection diagnostics")
+        window.geometry("680x500")
+        self.diagnostics_window = window
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", font=("Consolas", 9))
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set, state="disabled")
+        scrollbar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        self.diagnostics_text = text
+        window.protocol("WM_DELETE_WINDOW", self._close_diagnostics)
+        self._render_diagnostics()
+
+    def _close_diagnostics(self):
+        if self.diagnostics_window:
+            self.diagnostics_window.destroy()
+        self.diagnostics_window = None
+        self.diagnostics_text = None
+
+    def _update_diagnostics(self, values: dict):
+        self.diagnostics_state.update(values)
+        self._render_diagnostics()
+
+    def _render_diagnostics(self):
+        if not self.diagnostics_text or not self.diagnostics_text.winfo_exists():
+            return
+        scroll_position = self.diagnostics_text.yview()[0]
+        lines = [f"{key}:\n{value}" for key, value in self.diagnostics_state.items()]
+        self.diagnostics_text.configure(state="normal")
+        self.diagnostics_text.delete("1.0", "end")
+        self.diagnostics_text.insert("1.0", "\n\n".join(lines))
+        self.diagnostics_text.configure(state="disabled")
+        self.diagnostics_text.yview_moveto(scroll_position)
+
     def start_detection(self):
         if self.browser_thread and self.browser_thread.is_alive():
             return
+        self.visible_game_answers.clear()
+        self.visible_game_prompt = None
         mode = self.mode.get()
         self.browser_stop = threading.Event()
         self.detection_status.set("Starting a separate Chromium browser…")
@@ -534,10 +788,14 @@ class App(tk.Tk):
     def stop_detection(self):
         if self.browser_stop:
             self.browser_stop.set()
+            self.visible_game_answers.clear()
+            self.visible_game_prompt = None
             self.detection_status.set("Stopping browser detection…")
             self.detect_button.configure(text="Stopping…")
 
     def close_app(self):
+        if self.ai_cancel_event:
+            self.ai_cancel_event.set()
         if self.browser_thread and self.browser_thread.is_alive() and self.browser_stop:
             self.browser_stop.set()
             self.detection_status.set("Closing browser before exit…")
@@ -561,12 +819,22 @@ class App(tk.Tk):
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 self.after(0, self.detection_status.set, "Watching the game page for a prompt…")
                 last_prompt = ""
+                missed_prompt_polls = 0
                 seen_events: set[tuple[str, str, str]] = set()
                 while not stop_event.is_set():
                     try:
                         visible_text = page.locator("body").inner_text(timeout=1200)
-                        prompt = detect_question(visible_text)
+                        prompt, detection_method = detect_page_question(page, visible_text)
+                        visible_answers = extract_visible_answer_lines(visible_text, prompt or "")
+                        self.after(0, self._update_diagnostics, {
+                            "URL": page.url,
+                            "Detection method": detection_method if prompt else "No prompt pattern matched",
+                            "Selected prompt": prompt or "None",
+                            "Browser error": "None",
+                            "Extracted page text": visible_text[:8000],
+                        })
                         if prompt:
+                            missed_prompt_polls = 0
                             if prompt != last_prompt:
                                 last_prompt = prompt
                                 self.after(0, self._prompt_detected, mode, prompt)
@@ -575,13 +843,21 @@ class App(tk.Tk):
                                 if event not in seen_events:
                                     seen_events.add(event)
                                     self.after(0, self._save_detected_answer, mode, prompt, answer, status, reporter)
+                            self.after(0, self._update_visible_answers, mode, prompt, visible_answers)
                         else:
-                            last_prompt = ""
+                            missed_prompt_polls += 1
+                            if missed_prompt_polls >= 4:
+                                last_prompt = ""
                         page.wait_for_timeout(500)
-                    except PlaywrightError:
-                        if not context.pages:
-                            break
-                        page = context.pages[0]
+                    except PlaywrightError as exc:
+                        self.after(0, self._update_diagnostics, {"Browser error": str(exc), "Detection method": "Retrying after a temporary browser read error"})
+                        pages = [candidate for candidate in context.pages if not candidate.is_closed()]
+                        if pages:
+                            page = pages[-1]
+                        else:
+                            page = context.new_page()
+                            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        stop_event.wait(0.4)
                 context.close()
         except Exception as exc:
             self.after(0, self._detection_error, str(exc))
@@ -592,10 +868,33 @@ class App(tk.Tk):
     def _prompt_detected(self, mode: str, prompt: str):
         self.mode.set(mode)
         self.category.set(prompt)
+        self.visible_game_answers.clear()
+        self.visible_game_prompt = (mode, normalize(prompt))
         self.detection_status.set(f"Detected: {prompt}")
         if not self.compact_mode:
             self.toggle_compact()
         self.search()
+
+    def _update_visible_answers(self, mode: str, prompt: str, visible_answers: set[str]):
+        if self.mode.get() != mode or normalize(self.category.get()) != normalize(prompt):
+            return
+        self.visible_game_prompt = (mode, normalize(prompt))
+        self.visible_game_answers.update(visible_answers)
+        current = [(index, value) for index, value in self.result_answers.items() if normalize(value) in self.visible_game_answers]
+        for index, answer in reversed(current):
+            self._remove_result(index)
+            self.detection_status.set(f"Already used in game; hiding {answer}")
+
+    def _remove_result(self, index: int):
+        answer = self.result_answers.get(index)
+        self.results.delete(index)
+        self.result_answers = {
+            old_index - (old_index > index): value
+            for old_index, value in self.result_answers.items()
+            if old_index != index
+        }
+        if answer and normalize(answer) in self.ai_answers:
+            self.ai_answers.discard(normalize(answer))
 
     def _save_detected_answer(self, mode: str, prompt: str, answer: str, status: str, reporter: str | None):
         try:
@@ -608,6 +907,7 @@ class App(tk.Tk):
             self.detection_status.set(f"Could not save game feedback: {exc}")
 
     def _detection_error(self, error: str):
+        self._update_diagnostics({"Browser error": error, "Detection method": "Browser error"})
         self.detection_status.set("Browser detection could not start.")
         self.detect_button.configure(text="Detect prompt")
         messagebox.showerror("Browser detection", error)
@@ -619,6 +919,9 @@ class App(tk.Tk):
         self.search(regenerate=True)
 
     def search(self, regenerate: bool = False):
+        if self.ai_cancel_event:
+            self.ai_cancel_event.set()
+        self.ai_cancel_event = None
         self.search_generation += 1
         generation = self.search_generation
         previous_answers = list(self.result_answers.values()) if regenerate else []
@@ -626,34 +929,47 @@ class App(tk.Tk):
         if not category:
             messagebox.showinfo("Category required", "Enter a category or prompt first.")
             return
+        if self.browser_thread and self.browser_thread.is_alive():
+            self.detection_status.set("Watching the game page; manual prompt entered. Auto-detection remains active.")
+        if self.visible_game_prompt != (self.mode.get(), normalize(category)):
+            self.visible_game_answers.clear()
+            self.visible_game_prompt = None
         known = self.store.lookup(self.mode.get(), category)
         lex = self.store.lexicon_answers(category)
+        local_hints = [answer for answer in lex if candidate_matches_prompt(answer, category)]
         self.results.delete(0, "end")
         self.result_answers.clear()
         self.ai_answers.clear()
         shown = set()
         for row in known:
-            if row["status"] == "rejected":
+            if row["status"] == "rejected" or normalize(row["answer"]) in self.visible_game_answers:
                 continue
             label = f"[{row['status'].upper()}] {row['answer']}" + (f" — level: {row['level']}" if row["level"] else "") + (f" — by {row['reporter']}" if row["reporter"] else "")
             self._add_result(label, row["answer"])
             shown.add(normalize(row["answer"]))
         added_lex = 0
         for answer in lex:
-            if candidate_matches_prompt(answer, category) and normalize(answer) not in shown:
+            if candidate_matches_prompt(answer, category) and normalize(answer) not in shown and normalize(answer) not in self.visible_game_answers:
                 self._add_result(f"[LEXICON / UNVERIFIED] {answer}", answer)
                 shown.add(normalize(answer)); added_lex += 1
         self.results.insert("end", f"--- {len(known)} stored reports; {added_lex} lexicon suggestions ---")
-        useful_answers = {normalize(row["answer"]) for row in known if row["status"] == "accepted"}
-        useful_answers.update(normalize(answer) for answer in lex if candidate_matches_prompt(answer, category))
+        useful_answers = {
+            normalize(row["answer"]) for row in known
+            if row["status"] == "accepted" and normalize(row["answer"]) not in self.visible_game_answers
+        }
+        useful_answers.update(
+            normalize(answer) for answer in lex
+            if candidate_matches_prompt(answer, category) and normalize(answer) not in self.visible_game_answers
+        )
         useful_count = len(useful_answers)
         if regenerate or (self.use_ai.get() and useful_count < 5):
             self.results.insert("end", "Regenerating AI answers…" if regenerate else "AI candidates (unverified) will appear as they arrive…")
             needed = 8 if regenerate else max(1, 8 - useful_count)
             blocked = {normalize(row["answer"]) for row in known if row["status"] != "accepted"}
             prior = list(dict.fromkeys(list(shown) + previous_answers))
-            ai_known = prior + [row["answer"] for row in known if normalize(row["answer"]) in blocked]
-            threading.Thread(target=self._ai_worker, args=(category, ai_known, needed, self.mode.get(), generation, regenerate), daemon=True).start()
+            ai_known = prior + [row["answer"] for row in known if normalize(row["answer"]) in blocked] + list(self.visible_game_answers)
+            self.ai_cancel_event = threading.Event()
+            threading.Thread(target=self._ai_worker, args=(category, ai_known, needed, self.mode.get(), generation, regenerate, self.ai_cancel_event, local_hints), daemon=True).start()
         elif not known and not lex:
             self.results.insert("end", "No stored answers or matching lexicon. Enable Ollama or add a player report.")
         elif self.use_ai.get() and useful_count >= 5:
@@ -678,9 +994,13 @@ class App(tk.Tk):
         self.clipboard_append(answer)
 
     def clear_results(self):
+        if self.ai_cancel_event:
+            self.ai_cancel_event.set()
+        self.ai_cancel_event = None
         self.search_generation += 1
         self.results.delete(0, "end")
         self.result_answers.clear()
+        self.ai_answers.clear()
 
     def mark_selected(self, status: str):
         selection = self.results.curselection()
@@ -717,14 +1037,16 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Could not save", str(exc))
 
-    def _ai_worker(self, category: str, known: list[str], count: int, mode: str, generation: int, force: bool = False):
+    def _ai_worker(self, category: str, known: list[str], count: int, mode: str, generation: int, force: bool = False, cancel_event: threading.Event | None = None, hints: list[str] | None = None):
         try:
             answers = ollama_suggest(
                 category, known, count, mode,
                 on_candidate=lambda answer, fallback: self.after(0, self._append_ai_candidate, generation, answer, fallback),
                 force=force,
+                cancel_event=cancel_event,
+                hints=hints,
             )
-            if not answers:
+            if not answers and not (cancel_event and cancel_event.is_set()):
                 self.after(0, self._show_ai_empty, generation)
         except Exception as exc:
             self.after(0, self._show_ai_error, generation, str(exc))
@@ -732,7 +1054,7 @@ class App(tk.Tk):
     def _append_ai_candidate(self, generation: int, answer: str, fallback: bool):
         if generation != self.search_generation:
             return
-        if normalize(answer) in {normalize(value) for value in self.result_answers.values()}:
+        if normalize(answer) in self.visible_game_answers or normalize(answer) in {normalize(value) for value in self.result_answers.values()}:
             return
         label = "[AI FALLBACK / UNVERIFIED]" if fallback else "[AI / UNVERIFIED]"
         self._add_result(f"{label} {answer}", answer)
